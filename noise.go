@@ -24,7 +24,7 @@ func StartNoiseServer(anon bool) {
 	}
 
 	// uses state to send file data to the client
-	initializeNoise(true, "")
+	initializeNoise(true, "temp-psk")
 }
 
 func ReadClientHandshake(message []byte) []byte {
@@ -80,7 +80,7 @@ func initializeNoise(isServer bool, rawPsk string) {
 
 	if isServer && rawPsk == "" {
 		// TODO: randomize in the form ##-diceware-diceware
-		rawRandom := make([]byte, 2)
+		rawRandom := make([]byte, 3)
 		rand.Read(rawRandom)
 		rawPsk = fmt.Sprintf("%x", rawRandom)
 	}
@@ -119,7 +119,7 @@ func Encrypt(data []byte) []byte {
 func Decrypt(data []byte) []byte {
 	decrypted, err := send.Decrypt(nil, nil, data)
 	if err != nil {
-		log.Printf("Failed to decrypt message: %s", err)
+		log.Fatalf("Failed to decrypt message: %s", err)
 		return nil
 	}
 
