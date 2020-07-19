@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"encoding/base32"
 	"errors"
 	"flag"
@@ -24,33 +25,36 @@ import (
 )
 
 /* Features to implement:
-	Random PSKs
-	SHA256 checksum - hash client side and if it doesn't match, delete the file
+	A func with a Chunk receiver that encrypts the data with the type as AD and returns the encrypted byte slice
 	Post download, send an encrypted command to the server which tells it to reset the encryption state
 	Implement a max number of downloads (defaults to unlimited)
 */
 
-var filename string
+var filename, outputName string
 var file *os.File
 var size int64
+var anonymous bool
+var psk string
 
 func main() {
 	anonymousFlag := flag.Bool("a", false, "Enable anonymous downloads through a web browser. Disables transport encryption!")
 	portFlag := flag.String("l", "1832", "Listen port for server")
 	clientFlag := flag.String("c", "", "Connect to the provided server")
 	filenameFlag := flag.String("f", "", "File to send")
-	pskFlag := flag.String("p", "", "Password to connect to server with")
+	outputFlag := flag.String("o", "", "Output filename (defaults to original filename)")
+	pskFlag := flag.String("p", "", "Password to secure transfer with (if empty, one will be generated)")
 
 	flag.Parse()
-	anonymous := *anonymousFlag
+	anonymous = *anonymousFlag
 	port := *portFlag
 	client := *clientFlag
 	filename = *filenameFlag
+	outputName = *outputFlag
 	server := (filename != "")
-	psk := *pskFlag
+	psk = *pskFlag
 
 	if !server && client == "" {
-		log.Fatalf("Must act as a server or specify address to connect to")
+		log.Fatalf("Must act as a server (-f filename) or specify address to connect to (-c address)")
 	}
 
 	if server {
@@ -83,7 +87,7 @@ func main() {
 		log.Printf("Sending file %s (%d bytes)", filename, size)
 
 		// Initialize Noise and start web server
-		StartNoiseServer(anonymous)
+		psk = StartNoiseServer(anonymous, psk)
 		StartServer(port, anonymous)
 
 	} else {
@@ -113,15 +117,15 @@ func main() {
 		ReadServerHandshake(handshake)
 
 		// Noise is now setup and ready to use, get metadata and sleep
-		metaRaw := Decrypt(Get(client + "/api/v0/metadata"))
+		metaRaw := Decrypt(Get(client + "/api/v0/metadata"), []byte("metadata"))
 		var meta Metadata
 		Decode(metaRaw, &meta)
+		filename = meta.Filename
 		size = meta.Size
 
 		log.Printf("Will download %s (%d bytes) in 3 seconds unless Ctrl-C is pressed...", meta.Filename, size)
 		time.Sleep(3 * time.Second)
 
-		log.Printf("Downloading")
 		download(client + "/api/v0/download")
 	}
 }
@@ -200,11 +204,11 @@ func setupKey(w http.ResponseWriter, r *http.Request) {
 
 func getMetadata(w http.ResponseWriter, r *http.Request) {
 	packet := Encode(Metadata {
-		Filename: filename,
+		Filename: filepath.Base(filename),
 		Size:     size,
 	})
 
-	w.Write(Encrypt(packet))
+	w.Write(Encrypt(packet, []byte("metadata")))
 }
 
 func upload(w http.ResponseWriter, r *http.Request) {
@@ -214,6 +218,8 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	progress := pb.New64(size)
 	progress.SetUnits(pb.U_BYTES)
 	progress.Start()
+
+	hasher := sha256.New()
 
 	var data = make([]byte, 65536)
 	for {
@@ -230,20 +236,43 @@ func upload(w http.ResponseWriter, r *http.Request) {
 			data = data[:count]
 		}
 
-		// TODO: wrap this in a JSON struct
-		crypted := Encrypt(data)
+		crypted := Encrypt(data, []byte("data"))
 		w.Write(Encode(Chunk {
 			Data: crypted,
+			Type: "data",
 		}))
 
+		hasher.Write(data)
 		progress.Add(count)
 	}
 
+	w.Write(Encode(Chunk {
+		Data: Encrypt(hasher.Sum(nil), []byte("hash")),
+		Type: "hash",
+	}))
 	progress.Finish()
+
+	log.Printf("Upload complete")
+	ResetEncryptionState()
+	StartNoiseServer(anonymous, psk)
 }
 
 func download(addr string) {
-	dest, openErr := os.OpenFile("/tmp/dest", os.O_WRONLY | os.O_CREATE | os.O_TRUNC, 0655)
+	// Check to see if the file is already in the current directory only if we haven't specified a filename manually
+	if outputName == "" {
+		filename = "./" + filename
+		_, openErr := os.Open(filename)
+		if openErr == nil {
+			original := filename
+			filename = fmt.Sprintf("%s.%d", filename, GetNumber(1000))
+
+			log.Printf("Refusing to overwrite %s, downloaded file will be saved as %s", original, filename)
+		}
+	} else {
+		filename = outputName
+	}
+
+	dest, openErr := os.OpenFile(filename, os.O_WRONLY | os.O_CREATE | os.O_TRUNC, 0655)
 	if openErr != nil {
 		log.Fatalf("Unable to open destination: %s", openErr)
 	}
@@ -257,6 +286,9 @@ func download(addr string) {
 	progress := pb.New64(size)
 	progress.SetUnits(pb.U_BYTES)
 	progress.Start()
+	
+	hasher := sha256.New()
+	valid := false
 
 	var data = make([]byte, 1*1024*1024)
 	err := errors.New("")
@@ -274,13 +306,30 @@ func download(addr string) {
 
 		var chunk Chunk
 		Decode(data, &chunk)
-		decrypted := Decrypt(chunk.Data)
-		dest.Write(decrypted)
+		if chunk.Type == "data" {
+			decrypted := Decrypt(chunk.Data, []byte("data"))
+			dest.Write(decrypted)
+			hasher.Write(decrypted)
+			progress.Add(len(decrypted))
 
-		progress.Add(len(decrypted))
+		} else if chunk.Type == "hash" {
+			hashRecv := Decrypt(chunk.Data, []byte("hash"))
+			received := fmt.Sprintf("%x", hashRecv)
+			calculated := fmt.Sprintf("%x", hasher.Sum(nil))
+
+			if calculated != received {
+				log.Printf("Warning: Received data checksum does not match source")
+			} else {
+				valid = true
+			}
+
+			break
+		}
 	}
 
 	progress.Finish()
 
-	log.Printf("Download successful")
+	if valid {
+		log.Printf("Download successful, received data checksum matches source")
+	}
 }

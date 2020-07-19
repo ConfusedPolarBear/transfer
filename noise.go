@@ -17,14 +17,13 @@ var noiseConfig noise.Config
 var initialState *noise.HandshakeState
 var send, receive *noise.CipherState
 
-func StartNoiseServer(anon bool) {
+func StartNoiseServer(anon bool, psk string) string {
 	if anon {
 		log.Printf("Encryption: NONE")
-		return
+		return ""
 	}
 
-	// uses state to send file data to the client
-	initializeNoise(true, "temp-psk")
+	return initializeNoise(true, psk)
 }
 
 func ReadClientHandshake(message []byte) []byte {
@@ -48,7 +47,6 @@ func ReadClientHandshake(message []byte) []byte {
 }
 
 func StartNoiseClient(psk string) []byte {
-	// uses state to receive initial metadata struct and then raw data
 	initializeNoise(false, psk)
 
 	// Send initial message
@@ -63,8 +61,13 @@ func StartNoiseClient(psk string) []byte {
 func ReadServerHandshake(message []byte) {
 	_, to, from, writeErr := initialState.ReadMessage(nil, message)
 	if writeErr != nil {
-		log.Fatalf("Unable to reply to handshake from server: %s", writeErr)
-		return
+		// TODO: why does errors.Is not work?
+		if fmt.Sprintf("%s", writeErr) == "noise: message is too short" {
+			log.Fatalf("Incorrect PSK")
+
+		} else {
+			log.Fatalf("Unable to reply to handshake from server: %#v", writeErr)
+		}
 	}
 
 	log.Printf("Securely connected to server")
@@ -72,7 +75,7 @@ func ReadServerHandshake(message []byte) {
 	receive = from
 }
 
-func initializeNoise(isServer bool, rawPsk string) {
+func initializeNoise(isServer bool, rawPsk string) string {
 	/*
 		PSKs will use the numbers 1-99 (inclusive) and all 7,776 diceware words.
 		This provides 98 * 7776 * 7776 = 5,925,685,248 (roughly 2^32) possible PSKs.
@@ -82,7 +85,7 @@ func initializeNoise(isServer bool, rawPsk string) {
 		// TODO: randomize in the form ##-diceware-diceware
 		rawRandom := make([]byte, 3)
 		rand.Read(rawRandom)
-		rawPsk = fmt.Sprintf("%x", rawRandom)
+		rawPsk = fmt.Sprintf("%d%s-%s", GetNumber(98) + 1, GetWord(), GetWord())
 	}
 	
 	transform := strings.ReplaceAll(rawPsk, "-", "")
@@ -99,7 +102,7 @@ func initializeNoise(isServer bool, rawPsk string) {
 		PresharedKeyPlacement: 0,
 	}
 
-	log.Printf("Encryption: %s", noiseConfig.CipherSuite.Name())
+	log.Printf("Encryption: Noise_%s_%s", noiseConfig.Pattern.Name, noiseConfig.CipherSuite.Name())
 	if isServer {
 		log.Printf("==========================================")
 		log.Printf("Transfer password: %s", rawPsk)
@@ -111,14 +114,21 @@ func initializeNoise(isServer bool, rawPsk string) {
 	if stateErr != nil {
 		log.Fatalf("Unable to setup initial handshake state: %s", stateErr)
 	}
+
+	return rawPsk
 }
 
-func Encrypt(data []byte) []byte {
-	return send.Encrypt(nil, nil, data)
+func ResetEncryptionState() {
+	initialState, send, receive = nil, nil, nil
+	log.Printf("Encryption state reset")
 }
 
-func Decrypt(data []byte) []byte {
-	decrypted, err := send.Decrypt(nil, nil, data)
+func Encrypt(data, ad []byte) []byte {
+	return send.Encrypt(nil, ad, data)
+}
+
+func Decrypt(data, ad []byte) []byte {
+	decrypted, err := send.Decrypt(nil, ad, data)
 	if err != nil {
 		log.Fatalf("Failed to decrypt message: %s", err)
 		return nil
