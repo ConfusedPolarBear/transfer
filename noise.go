@@ -101,9 +101,10 @@ func initializeNoise(isServer bool, rawPsk string) {
 
 	log.Printf("Encryption: %s", noiseConfig.CipherSuite.Name())
 	if isServer {
+		log.Printf("==========================================")
 		log.Printf("Transfer password: %s", rawPsk)
+		log.Printf("==========================================")
 	}
-	// log.Printf("Handshake pattern: %s", noiseConfig.Pattern.Name)
 
 	stateErr := errors.New("ok")
 	initialState, stateErr = noise.NewHandshakeState(noiseConfig)

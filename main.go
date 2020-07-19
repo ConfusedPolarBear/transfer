@@ -4,29 +4,30 @@
 package main
 
 import (
-	"encoding/base32"
-	"flag"
-	"log"
-	"io"
-	"errors"
-	"net/http"
-	"fmt"
-	"path/filepath"
-	"time"
-	"os"
-	"net/url"
 	"bufio"
-	
+	"encoding/base32"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
 	"github.com/gorilla/mux"
-	//"github.com/cheggaaa/pb"
+	"github.com/cheggaaa/pb"
 )
 
 /* Features to implement:
 	Random PSKs
-	List IP addresses on the server
-	Progress bars server & client side
 	SHA256 checksum - hash client side and if it doesn't match, delete the file
 	Post download, send an encrypted command to the server which tells it to reset the encryption state
+	Implement a max number of downloads (defaults to unlimited)
 */
 
 var filename string
@@ -34,10 +35,6 @@ var file *os.File
 var size int64
 
 func main() {
-	// server: ./transfer -s -f input.txt
-	// client: ./transfer -c http://server.test
-
-	// TODO: implement a max number of downloads (defaults to unlimited)
 	anonymousFlag := flag.Bool("a", false, "Enable anonymous downloads through a web browser. Disables transport encryption!")
 	portFlag := flag.String("l", "1832", "Listen port for server")
 	clientFlag := flag.String("c", "", "Connect to the provided server")
@@ -57,9 +54,6 @@ func main() {
 	}
 
 	if server {
-		// Initialize Noise
-		StartNoiseServer(anonymous)
-
 		// Open and stat input file
 		err := errors.New("ok")
 		file, err = os.Open(filename)
@@ -70,8 +64,26 @@ func main() {
 		stat, _ := file.Stat()
 		size = stat.Size()
 
-		// Send it
+		// Print local port and addresses
+		local := ""
+		addresses, _ := net.InterfaceAddrs()
+		for _, raw := range addresses {
+			// Remove the subnet
+			addr := raw.String()
+			slash := strings.LastIndex(addr, "/")
+			if slash != -1 {
+				addr = addr[:slash]
+			}
+
+			local += addr + ", "
+		}
+		log.Printf("Addresses: %s", local)
+		log.Printf("Listening on port %s", port)
+
 		log.Printf("Sending file %s (%d bytes)", filename, size)
+
+		// Initialize Noise and start web server
+		StartNoiseServer(anonymous)
 		StartServer(port, anonymous)
 
 	} else {
@@ -104,8 +116,9 @@ func main() {
 		metaRaw := Decrypt(Get(client + "/api/v0/metadata"))
 		var meta Metadata
 		Decode(metaRaw, &meta)
+		size = meta.Size
 
-		log.Printf("Will download %s (%d bytes) in 3 seconds unless Ctrl-C is pressed...", meta.Filename, meta.Size)
+		log.Printf("Will download %s (%d bytes) in 3 seconds unless Ctrl-C is pressed...", meta.Filename, size)
 		time.Sleep(3 * time.Second)
 
 		log.Printf("Downloading")
@@ -114,7 +127,6 @@ func main() {
 }
 
 func Get(url string) []byte {
-	// log.Printf("Requesting %s", url)
 	resp, err := http.Get(url)
 	if err != nil {
 		log.Fatalf("Unable to connect to server: %s", err)
@@ -155,11 +167,10 @@ func StartServer(port string, anonymous bool) {
 	srv := &http.Server{
 		Handler:      r,
 		Addr:         port,
-		WriteTimeout: 15 * time.Second,
+		WriteTimeout: 15 * time.Minute,
 		ReadTimeout:  15 * time.Second,
 	}
-
-	log.Printf("Server listening on %s", port)
+	
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -200,6 +211,10 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	// FIXME: use locking
 	file.Seek(0, 0)
 
+	progress := pb.New64(size)
+	progress.SetUnits(pb.U_BYTES)
+	progress.Start()
+
 	var data = make([]byte, 65536)
 	for {
 		count, err := file.Read(data)
@@ -216,12 +231,15 @@ func upload(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// TODO: wrap this in a JSON struct
-		// log.Printf("sending chunk %d", count)
 		crypted := Encrypt(data)
 		w.Write(Encode(Chunk {
 			Data: crypted,
 		}))
+
+		progress.Add(count)
 	}
+
+	progress.Finish()
 }
 
 func download(addr string) {
@@ -236,12 +254,16 @@ func download(addr string) {
 		log.Fatalf("Unable to connect to server: %s", httpErr)
 	}
 
-	var data = make([]byte, 65536+50)
+	progress := pb.New64(size)
+	progress.SetUnits(pb.U_BYTES)
+	progress.Start()
+
+	var data = make([]byte, 1*1024*1024)
 	err := errors.New("")
 	reader := bufio.NewReader(resp.Body)
 	for {
 		// Read until the end of the next JSON byte stream
-		data, err = reader.ReadBytes([]byte("}")[0])
+		data, err = reader.ReadBytes('}')
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("Error reading file: %s", err)
@@ -252,8 +274,13 @@ func download(addr string) {
 
 		var chunk Chunk
 		Decode(data, &chunk)
-		dest.Write(Decrypt(chunk.Data))
+		decrypted := Decrypt(chunk.Data)
+		dest.Write(decrypted)
+
+		progress.Add(len(decrypted))
 	}
+
+	progress.Finish()
 
 	log.Printf("Download successful")
 }
