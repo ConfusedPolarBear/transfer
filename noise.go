@@ -120,7 +120,6 @@ func initializeNoise(isServer bool, rawPsk string) string {
 
 func ResetEncryptionState() {
 	initialState, send, receive = nil, nil, nil
-	log.Printf("Encryption state reset")
 }
 
 func Encrypt(data, ad []byte) []byte {

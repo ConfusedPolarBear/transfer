@@ -26,8 +26,9 @@ import (
 
 /* Features to implement:
 	A func with a Chunk receiver that encrypts the data with the type as AD and returns the encrypted byte slice
-	Post download, send an encrypted command to the server which tells it to reset the encryption state
 	Implement a max number of downloads (defaults to unlimited)
+	Upload file/text?
+	Multiple file support (tar all files, send and auto extract)
 */
 
 var filename, outputName string
@@ -35,6 +36,7 @@ var file *os.File
 var size int64
 var anonymous bool
 var psk string
+var max int
 
 func main() {
 	anonymousFlag := flag.Bool("a", false, "Enable anonymous downloads through a web browser. Disables transport encryption!")
@@ -43,6 +45,7 @@ func main() {
 	filenameFlag := flag.String("f", "", "File to send")
 	outputFlag := flag.String("o", "", "Output filename (defaults to original filename)")
 	pskFlag := flag.String("p", "", "Password to secure transfer with (if empty, one will be generated)")
+	maxFlag := flag.Int("m", 1, "Maximum number of transfers permitted")
 
 	flag.Parse()
 	anonymous = *anonymousFlag
@@ -52,6 +55,7 @@ func main() {
 	outputName = *outputFlag
 	server := (filename != "")
 	psk = *pskFlag
+	max = *maxFlag
 
 	if !server && client == "" {
 		log.Fatalf("Must act as a server (-f filename) or specify address to connect to (-c address)")
@@ -77,6 +81,10 @@ func main() {
 			slash := strings.LastIndex(addr, "/")
 			if slash != -1 {
 				addr = addr[:slash]
+			}
+
+			if addr == "127.0.0.1" || addr == "::1" {
+				continue
 			}
 
 			local += addr + ", "
@@ -123,8 +131,8 @@ func main() {
 		filename = meta.Filename
 		size = meta.Size
 
-		log.Printf("Will download %s (%d bytes) in 3 seconds unless Ctrl-C is pressed...", meta.Filename, size)
-		time.Sleep(3 * time.Second)
+		log.Printf("Press Enter to confirm transfer of %s (%d bytes)", meta.Filename, size)
+		bufio.NewReader(os.Stdin).ReadString('\n')
 
 		download(client + "/api/v0/download")
 	}
@@ -246,15 +254,29 @@ func upload(w http.ResponseWriter, r *http.Request) {
 		progress.Add(count)
 	}
 
+	hash := Encrypt(hasher.Sum(nil), []byte("hash"))
 	w.Write(Encode(Chunk {
-		Data: Encrypt(hasher.Sum(nil), []byte("hash")),
+		Data: hash,
 		Type: "hash",
 	}))
 	progress.Finish()
 
 	log.Printf("Upload complete")
-	ResetEncryptionState()
-	StartNoiseServer(anonymous, psk)
+
+	max -= 1
+	if max != 0 {
+		log.Printf("%d more transfers permitted, resetting for next client", max)
+		ResetEncryptionState()
+		StartNoiseServer(anonymous, psk)
+
+	} else {
+		log.Printf("Maximum number of transfers reached, exiting")
+
+		go func() {
+			time.Sleep(1 * time.Second)
+			os.Exit(0)
+		}()
+	}
 }
 
 func download(addr string) {
@@ -279,6 +301,7 @@ func download(addr string) {
 
 	// TODO: dedup with Get()
 	resp, httpErr := http.Get(addr)
+	defer resp.Body.Close()
 	if httpErr != nil {
 		log.Fatalf("Unable to connect to server: %s", httpErr)
 	}

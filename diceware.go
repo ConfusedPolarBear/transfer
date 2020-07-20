@@ -2037,7 +2037,7 @@ drizzly
 drone
 drool
 droop
-drop-down
+dropdown
 dropbox
 dropkick
 droplet
@@ -2556,7 +2556,7 @@ feed
 feel
 feisty
 feline
-felt-tip
+felttip
 feminine
 feminism
 feminist
@@ -6668,7 +6668,7 @@ synthesis
 synthetic
 syrup
 system
-t-shirt
+tshirt
 tabasco
 tabby
 tableful
@@ -7776,7 +7776,7 @@ yiddish
 yield
 yin
 yippee
-yo-yo
+yoyo
 yodel
 yoga
 yogurt
