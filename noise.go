@@ -39,7 +39,7 @@ func ReadClientHandshake(message []byte) []byte {
 		return nil
 	}
 
-	log.Printf("Securely connected to client")
+	log.Printf("Securely connected to client %s", GetChannel())
 	send = to
 	receive = from
 
@@ -72,7 +72,7 @@ func ReadServerHandshake(message []byte) bool {
 		return false
 	}
 
-	log.Printf("Securely connected to server")
+	log.Printf("Securely connected to server %s", GetChannel())
 	send = to
 	receive = from
 

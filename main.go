@@ -30,6 +30,7 @@ import (
 /* Features to implement:
 	Upload file/text?
 	Multiple file support (tar all files, send and auto extract)
+	With anonymous mode, accept a TLS certificate/key and listen on HTTPS
 */
 
 var filename, outputName string
@@ -102,7 +103,6 @@ func main() {
 
 	} else {
 		// Verify server address and normalize it if needed
-		original := client
 		parsed, parseErr := url.Parse(client)
 		if parseErr != nil {
 			log.Fatalf("Unable to parse server address %s", client)
@@ -112,12 +112,7 @@ func main() {
 			parsed.Scheme = "http"
 			parsed.Path += ":1832"
 		}
-
 		client = parsed.String()
-
-		if client != original {
-			log.Printf("Rewrote server address from '%s' to '%s'", original, client)
-		}
 
 		doPrompt := (psk == "")
 		for {
@@ -144,7 +139,6 @@ func main() {
 		filename = meta.Filename
 		size = meta.Size
 
-		log.Printf("Fingerprint: %s", GetChannel())
 		log.Printf("Press Enter to confirm transfer of %s (%d bytes)", meta.Filename, size)
 		prompt("", false)
 
@@ -233,7 +227,9 @@ func setupKey(w http.ResponseWriter, r *http.Request) {
 		failures -= 1
 		if failures <= 0 {
 			log.Printf("Warning: Too many failed authentications, exiting")
-			srv.Shutdown(context.TODO())
+			go func() {
+				srv.Shutdown(context.TODO())
+			}()
 		} else {
 			log.Printf("Warning: Failed to authenticate connecting client, %d more attempts remaining", failures)
 		}
@@ -243,8 +239,6 @@ func setupKey(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.Write(handshake)
 	}
-
-	log.Printf("Fingerprint: %s", GetChannel())
 }
 
 func getMetadata(w http.ResponseWriter, r *http.Request) {
@@ -299,7 +293,7 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	}))
 	progress.Finish()
 
-	log.Printf("Upload complete")
+	log.Printf("Transfer complete")
 
 	max -= 1
 	if max != 0 {
@@ -309,7 +303,9 @@ func upload(w http.ResponseWriter, r *http.Request) {
 
 	} else {
 		log.Printf("Maximum number of transfers reached, exiting")
-		srv.Shutdown(context.TODO())
+		go func() {
+			srv.Shutdown(context.TODO())
+		}()
 	}
 }
 
@@ -387,7 +383,7 @@ func download(addr string) {
 	progress.Finish()
 
 	if valid {
-		log.Printf("Download successful, received data checksum matches source")
+		log.Printf("Transfer successful, received data checksum matches source")
 		dest.Sync()
 	}
 }
