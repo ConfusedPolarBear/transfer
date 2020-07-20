@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/base32"
 	"errors"
@@ -19,14 +20,14 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"syscall"
 
 	"github.com/gorilla/mux"
 	"github.com/cheggaaa/pb"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 /* Features to implement:
-	A func with a Chunk receiver that encrypts the data with the type as AD and returns the encrypted byte slice
-	Implement a max number of downloads (defaults to unlimited)
 	Upload file/text?
 	Multiple file support (tar all files, send and auto extract)
 */
@@ -37,6 +38,8 @@ var size int64
 var anonymous bool
 var psk string
 var max int
+var failures = 3
+var srv *http.Server
 
 func main() {
 	anonymousFlag := flag.Bool("a", false, "Enable anonymous downloads through a web browser. Disables transport encryption!")
@@ -44,7 +47,7 @@ func main() {
 	clientFlag := flag.String("c", "", "Connect to the provided server")
 	filenameFlag := flag.String("f", "", "File to send")
 	outputFlag := flag.String("o", "", "Output filename (defaults to original filename)")
-	pskFlag := flag.String("p", "", "Password to secure transfer with (if empty, one will be generated)")
+	pskFlag := flag.String("p", "", "Password to secure transfer with. If empty, servers will generate one and clients will prompt")
 	maxFlag := flag.Int("m", 1, "Maximum number of transfers permitted")
 
 	flag.Parse()
@@ -89,8 +92,7 @@ func main() {
 
 			local += addr + ", "
 		}
-		log.Printf("Addresses: %s", local)
-		log.Printf("Listening on port %s", port)
+		log.Printf("Listening on port %s on: %s", port, local[:len(local)-2])
 
 		log.Printf("Sending file %s (%d bytes)", filename, size)
 
@@ -117,12 +119,23 @@ func main() {
 			log.Printf("Rewrote server address from '%s' to '%s'", original, client)
 		}
 
-		// Initialize Noise and get handshake msg
-		raw := StartNoiseClient(psk)
-		encoded := base32.StdEncoding.EncodeToString(raw)
-		handshake := Get(client + "/api/v0/key/" + encoded)
-		
-		ReadServerHandshake(handshake)
+		doPrompt := (psk == "")
+		for {
+			if doPrompt {
+				psk = prompt("Enter password", true)
+			}
+	
+			// Initialize Noise and get handshake msg
+			raw := StartNoiseClient(psk)
+			encoded := base32.StdEncoding.EncodeToString(raw)
+			handshake := Get(client + "/api/v0/key/" + encoded)
+			
+			if(ReadServerHandshake(handshake)) {
+				break
+			} else if !doPrompt {
+				log.Fatalf("Invalid PSK")
+			}
+		}
 
 		// Noise is now setup and ready to use, get metadata and sleep
 		metaRaw := Decrypt(Get(client + "/api/v0/metadata"), []byte("metadata"))
@@ -131,8 +144,9 @@ func main() {
 		filename = meta.Filename
 		size = meta.Size
 
+		log.Printf("Fingerprint: %s", GetChannel())
 		log.Printf("Press Enter to confirm transfer of %s (%d bytes)", meta.Filename, size)
-		bufio.NewReader(os.Stdin).ReadString('\n')
+		prompt("", false)
 
 		download(client + "/api/v0/download")
 	}
@@ -176,7 +190,7 @@ func StartServer(port string, anonymous bool) {
 		r.HandleFunc("/", browserDownload).Methods("GET")
 	}
 
-	srv := &http.Server{
+	srv = &http.Server{
 		Handler:      r,
 		Addr:         port,
 		WriteTimeout: 15 * time.Minute,
@@ -190,24 +204,47 @@ func browserDownload(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Anonymous user is downloading from %s", r.RemoteAddr)
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(filename)))
 
-	// FIXME: this is not thread safe :(
+	// FIXME: this is not thread safe and will happily serve up truncated files if more than one client makes a request
 	// use a mutex?
 	file.Seek(0, 0)
-	_, err := io.Copy(w, file)
+
+	progress := pb.New64(size)
+	progress.SetUnits(pb.U_BYTES)
+	progress.Start()
+	barReader := progress.NewProxyReader(file)
+	_, err := io.Copy(w, barReader)
 	if err != nil {
 		log.Printf("Failed to fully transmit file: %s", err)
 	}
+
+	progress.Finish()
 }
 
 func setupKey(w http.ResponseWriter, r *http.Request) {
 	encoded := mux.Vars(r)["handshake"]
-	handshake, err := base32.StdEncoding.DecodeString(encoded)
+	incoming, err := base32.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		log.Printf("Invalid handshake")
 		return
 	}
 
-	w.Write(ReadClientHandshake(handshake))
+	handshake := ReadClientHandshake(incoming)
+	if handshake == nil {
+		failures -= 1
+		if failures <= 0 {
+			log.Printf("Warning: Too many failed authentications, exiting")
+			srv.Shutdown(context.TODO())
+		} else {
+			log.Printf("Warning: Failed to authenticate connecting client, %d more attempts remaining", failures)
+		}
+
+		http.Error(w, "", http.StatusForbidden)
+		return
+	} else {
+		w.Write(handshake)
+	}
+
+	log.Printf("Fingerprint: %s", GetChannel())
 }
 
 func getMetadata(w http.ResponseWriter, r *http.Request) {
@@ -220,7 +257,8 @@ func getMetadata(w http.ResponseWriter, r *http.Request) {
 }
 
 func upload(w http.ResponseWriter, r *http.Request) {
-	// FIXME: use locking
+	// No locking is needed here because of the way we have noise setup - it's state machine only allows one client
+	// to connect at a time, new clients fail with the error "noise: no handshake messages left"
 	file.Seek(0, 0)
 
 	progress := pb.New64(size)
@@ -271,11 +309,7 @@ func upload(w http.ResponseWriter, r *http.Request) {
 
 	} else {
 		log.Printf("Maximum number of transfers reached, exiting")
-
-		go func() {
-			time.Sleep(1 * time.Second)
-			os.Exit(0)
-		}()
+		srv.Shutdown(context.TODO())
 	}
 }
 
@@ -354,5 +388,35 @@ func download(addr string) {
 
 	if valid {
 		log.Printf("Download successful, received data checksum matches source")
+		dest.Sync()
 	}
+}
+
+func prompt(msg string, hide bool) string {
+	data := ""
+	err := errors.New("")
+
+	if msg != "" {
+		fmt.Printf("%s: ", msg)
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+
+	if hide {
+		raw, secretErr := terminal.ReadPassword(int(syscall.Stdin))
+		fmt.Println()
+		err = secretErr
+		data = string(raw)
+
+	} else {
+		raw, clearErr := reader.ReadString('\n')
+		err = clearErr
+		data = strings.TrimSpace(raw)		// Remove the trailing newline
+	}
+
+	if err != nil {
+		log.Fatalf("Unable to prompt for input: %s", err)
+	}
+
+	return data
 }

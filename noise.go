@@ -58,21 +58,25 @@ func StartNoiseClient(psk string) []byte {
 	return hello
 }
 
-func ReadServerHandshake(message []byte) {
+func ReadServerHandshake(message []byte) bool {
 	_, to, from, writeErr := initialState.ReadMessage(nil, message)
 	if writeErr != nil {
 		// TODO: why does errors.Is not work?
 		if fmt.Sprintf("%s", writeErr) == "noise: message is too short" {
-			log.Fatalf("Incorrect PSK")
+			log.Printf("Incorrect PSK")
 
 		} else {
 			log.Fatalf("Unable to reply to handshake from server: %#v", writeErr)
 		}
+
+		return false
 	}
 
 	log.Printf("Securely connected to server")
 	send = to
 	receive = from
+
+	return true
 }
 
 func initializeNoise(isServer bool, rawPsk string) string {
@@ -104,9 +108,7 @@ func initializeNoise(isServer bool, rawPsk string) string {
 
 	log.Printf("Encryption: Noise_%s_%s", noiseConfig.Pattern.Name, noiseConfig.CipherSuite.Name())
 	if isServer {
-		log.Printf("==========================================")
 		log.Printf("Transfer password: %s", rawPsk)
-		log.Printf("==========================================")
 	}
 
 	stateErr := errors.New("ok")
@@ -116,6 +118,10 @@ func initializeNoise(isServer bool, rawPsk string) string {
 	}
 
 	return rawPsk
+}
+
+func GetChannel() string {
+	return fmt.Sprintf("%x", initialState.ChannelBinding())
 }
 
 func ResetEncryptionState() {
